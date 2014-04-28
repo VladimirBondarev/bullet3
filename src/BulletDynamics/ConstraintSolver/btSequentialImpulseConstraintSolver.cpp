@@ -48,46 +48,223 @@ btSequentialImpulseConstraintSolver::~btSequentialImpulseConstraintSolver()
 }
 
 #ifdef USE_SIMD
-#include <emmintrin.h>
+#include <intrin.h>
 #define btVecSplat(x, e) _mm_shuffle_ps(x, x, _MM_SHUFFLE(e,e,e,e))
 static inline __m128 btSimdDot3( __m128 vec0, __m128 vec1 )
 {
 	__m128 result = _mm_mul_ps( vec0, vec1);
 	return _mm_add_ps( btVecSplat( result, 0 ), _mm_add_ps( btVecSplat( result, 1 ), btVecSplat( result, 2 ) ) );
 }
-#endif//USE_SIMD
+
+#define USE_FMA					1
+#define USE_FMA3_INSTEAD_FMA4	1
+#define USE_SSE4_DOT			0
+
+#define SSE4_DP(a, b)			_mm_dp_ps(a, b, 0x7f)
+#define SSE4_DP_FP(a, b)		_mm_cvtss_f32(_mm_dp_ps(a, b, 0x7f))
+
+#if USE_SSE4_DOT
+#define DOT_PRODUCT(a, b)		SSE4_DP(a, b)
+#else
+#define DOT_PRODUCT(a, b)		btSimdDot3(a, b)
+#endif
+
+#if USE_FMA
+#if USE_FMA3_INSTEAD_FMA4
+// a*b + c
+#define FMADD(a, b, c)		_mm_fmadd_ps(a, b, c)
+// -(a*b) + c
+#define FMNADD(a, b, c)		_mm_fnmadd_ps(a, b, c)
+#else // USE_FMA3
+// a*b + c
+#define FMADD(a, b, c)		_mm_macc_ps(a, b, c)
+// -(a*b) + c
+#define FMNADD(a, b, c)		_mm_nmacc_ps(a, b, c)
+#endif
+#else // USE_FMA
+// c + a*b
+#define FMADD(a, b, c)		_mm_add_ps(c, _mm_mul_ps(a, b))
+// c - a*b
+#define FMNADD(a, b, c)		_mm_sub_ps(c, _mm_mul_ps(a, b))
+#endif
 
 // Project Gauss Seidel or the equivalent Sequential Impulse
-btSimdScalar btSequentialImpulseConstraintSolver::resolveSingleConstraintRowGenericSIMD(btSolverBody& body1,btSolverBody& body2,const btSolverConstraint& c)
+static btSimdScalar gResolveSingleConstraintRowGeneric_sse2(btSolverBody& body1, btSolverBody& body2, const btSolverConstraint& c)
 {
-#ifdef USE_SIMD
 	__m128 cpAppliedImp = _mm_set1_ps(c.m_appliedImpulse);
 	__m128	lowerLimit1 = _mm_set1_ps(c.m_lowerLimit);
 	__m128	upperLimit1 = _mm_set1_ps(c.m_upperLimit);
-	btSimdScalar deltaImpulse = _mm_sub_ps(_mm_set1_ps(c.m_rhs), _mm_mul_ps(_mm_set1_ps(c.m_appliedImpulse),_mm_set1_ps(c.m_cfm)));
-	__m128 deltaVel1Dotn	=	_mm_add_ps(btSimdDot3(c.m_contactNormal1.mVec128,body1.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos1CrossNormal.mVec128,body1.internalGetDeltaAngularVelocity().mVec128));
-	__m128 deltaVel2Dotn	=	_mm_add_ps(btSimdDot3(c.m_contactNormal2.mVec128,body2.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos2CrossNormal.mVec128,body2.internalGetDeltaAngularVelocity().mVec128));
-	deltaImpulse	=	_mm_sub_ps(deltaImpulse,_mm_mul_ps(deltaVel1Dotn,_mm_set1_ps(c.m_jacDiagABInv)));
-	deltaImpulse	=	_mm_sub_ps(deltaImpulse,_mm_mul_ps(deltaVel2Dotn,_mm_set1_ps(c.m_jacDiagABInv)));
-	btSimdScalar sum = _mm_add_ps(cpAppliedImp,deltaImpulse);
-	btSimdScalar resultLowerLess,resultUpperLess;
-	resultLowerLess = _mm_cmplt_ps(sum,lowerLimit1);
-	resultUpperLess = _mm_cmplt_ps(sum,upperLimit1);
-	__m128 lowMinApplied = _mm_sub_ps(lowerLimit1,cpAppliedImp);
-	deltaImpulse = _mm_or_ps( _mm_and_ps(resultLowerLess, lowMinApplied), _mm_andnot_ps(resultLowerLess, deltaImpulse) );
-	c.m_appliedImpulse = _mm_or_ps( _mm_and_ps(resultLowerLess, lowerLimit1), _mm_andnot_ps(resultLowerLess, sum) );
-	__m128 upperMinApplied = _mm_sub_ps(upperLimit1,cpAppliedImp);
-	deltaImpulse = _mm_or_ps( _mm_and_ps(resultUpperLess, deltaImpulse), _mm_andnot_ps(resultUpperLess, upperMinApplied) );
-	c.m_appliedImpulse = _mm_or_ps( _mm_and_ps(resultUpperLess, c.m_appliedImpulse), _mm_andnot_ps(resultUpperLess, upperLimit1) );
-	__m128	linearComponentA = _mm_mul_ps(c.m_contactNormal1.mVec128,body1.internalGetInvMass().mVec128);
-	__m128	linearComponentB = _mm_mul_ps((c.m_contactNormal2).mVec128,body2.internalGetInvMass().mVec128);
+	btSimdScalar deltaImpulse = _mm_sub_ps(_mm_set1_ps(c.m_rhs), _mm_mul_ps(_mm_set1_ps(c.m_appliedImpulse), _mm_set1_ps(c.m_cfm)));
+	__m128 deltaVel1Dotn = _mm_add_ps(btSimdDot3(c.m_contactNormal1.mVec128, body1.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos1CrossNormal.mVec128, body1.internalGetDeltaAngularVelocity().mVec128));
+	__m128 deltaVel2Dotn = _mm_add_ps(btSimdDot3(c.m_contactNormal2.mVec128, body2.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos2CrossNormal.mVec128, body2.internalGetDeltaAngularVelocity().mVec128));
+	deltaImpulse = _mm_sub_ps(deltaImpulse, _mm_mul_ps(deltaVel1Dotn, _mm_set1_ps(c.m_jacDiagABInv)));
+	deltaImpulse = _mm_sub_ps(deltaImpulse, _mm_mul_ps(deltaVel2Dotn, _mm_set1_ps(c.m_jacDiagABInv)));
+	btSimdScalar sum = _mm_add_ps(cpAppliedImp, deltaImpulse);
+	btSimdScalar resultLowerLess, resultUpperLess;
+	resultLowerLess = _mm_cmplt_ps(sum, lowerLimit1);
+	resultUpperLess = _mm_cmplt_ps(sum, upperLimit1);
+	__m128 lowMinApplied = _mm_sub_ps(lowerLimit1, cpAppliedImp);
+	deltaImpulse = _mm_or_ps(_mm_and_ps(resultLowerLess, lowMinApplied), _mm_andnot_ps(resultLowerLess, deltaImpulse));
+	c.m_appliedImpulse = _mm_or_ps(_mm_and_ps(resultLowerLess, lowerLimit1), _mm_andnot_ps(resultLowerLess, sum));
+	__m128 upperMinApplied = _mm_sub_ps(upperLimit1, cpAppliedImp);
+	deltaImpulse = _mm_or_ps(_mm_and_ps(resultUpperLess, deltaImpulse), _mm_andnot_ps(resultUpperLess, upperMinApplied));
+	c.m_appliedImpulse = _mm_or_ps(_mm_and_ps(resultUpperLess, c.m_appliedImpulse), _mm_andnot_ps(resultUpperLess, upperLimit1));
+	__m128	linearComponentA = _mm_mul_ps(c.m_contactNormal1.mVec128, body1.internalGetInvMass().mVec128);
+	__m128	linearComponentB = _mm_mul_ps((c.m_contactNormal2).mVec128, body2.internalGetInvMass().mVec128);
 	__m128 impulseMagnitude = deltaImpulse;
-	body1.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaLinearVelocity().mVec128,_mm_mul_ps(linearComponentA,impulseMagnitude));
-	body1.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaAngularVelocity().mVec128 ,_mm_mul_ps(c.m_angularComponentA.mVec128,impulseMagnitude));
-	body2.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaLinearVelocity().mVec128,_mm_mul_ps(linearComponentB,impulseMagnitude));
-	body2.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaAngularVelocity().mVec128 ,_mm_mul_ps(c.m_angularComponentB.mVec128,impulseMagnitude));
-
+	body1.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaLinearVelocity().mVec128, _mm_mul_ps(linearComponentA, impulseMagnitude));
+	body1.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaAngularVelocity().mVec128, _mm_mul_ps(c.m_angularComponentA.mVec128, impulseMagnitude));
+	body2.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaLinearVelocity().mVec128, _mm_mul_ps(linearComponentB, impulseMagnitude));
+	body2.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaAngularVelocity().mVec128, _mm_mul_ps(c.m_angularComponentB.mVec128, impulseMagnitude));
 	return deltaImpulse;
+}
+
+
+// Enhanced version of gResolveSingleConstraintRowGeneric_sse2 with SSE4.1 and FMA3
+static btSimdScalar gResolveSingleConstraintRowGeneric_sse4_1_fma3(btSolverBody& body1, btSolverBody& body2, const btSolverConstraint& c)
+{
+	__m128 tmp					= _mm_set_ps1(c.m_jacDiagABInv);
+	__m128 deltaImpulse			= _mm_set_ps1(c.m_rhs - btScalar(c.m_appliedImpulse)*c.m_cfm);
+	const __m128 lowerLimit		= _mm_set_ps1(c.m_lowerLimit);
+	const __m128 upperLimit		= _mm_set_ps1(c.m_upperLimit);
+	const __m128 deltaVel1Dotn	= _mm_add_ps(DOT_PRODUCT(c.m_contactNormal1.mVec128, body1.internalGetDeltaLinearVelocity().mVec128), DOT_PRODUCT(c.m_relpos1CrossNormal.mVec128, body1.internalGetDeltaAngularVelocity().mVec128));
+	const __m128 deltaVel2Dotn	= _mm_add_ps(DOT_PRODUCT(c.m_contactNormal2.mVec128, body2.internalGetDeltaLinearVelocity().mVec128), DOT_PRODUCT(c.m_relpos2CrossNormal.mVec128, body2.internalGetDeltaAngularVelocity().mVec128));
+	deltaImpulse				= FMNADD(deltaVel1Dotn, tmp, deltaImpulse);
+	deltaImpulse				= FMNADD(deltaVel2Dotn, tmp, deltaImpulse);
+	tmp							= _mm_add_ps(c.m_appliedImpulse, deltaImpulse); // sum
+	const __m128 maskLower		= _mm_cmpgt_ps(tmp, lowerLimit);
+	const __m128 maskUpper		= _mm_cmpgt_ps(upperLimit, tmp);
+	deltaImpulse				= _mm_blendv_ps(_mm_sub_ps(lowerLimit, c.m_appliedImpulse), _mm_blendv_ps(_mm_sub_ps(upperLimit, c.m_appliedImpulse), deltaImpulse, maskUpper), maskLower);
+	c.m_appliedImpulse			= _mm_blendv_ps(lowerLimit, _mm_blendv_ps(upperLimit, tmp, maskUpper), maskLower);
+	body1.internalGetDeltaLinearVelocity().mVec128	= FMADD(_mm_mul_ps(c.m_contactNormal1.mVec128, body1.internalGetInvMass().mVec128), deltaImpulse, body1.internalGetDeltaLinearVelocity().mVec128);
+	body1.internalGetDeltaAngularVelocity().mVec128 = FMADD(c.m_angularComponentA.mVec128, deltaImpulse, body1.internalGetDeltaAngularVelocity().mVec128);
+	body2.internalGetDeltaLinearVelocity().mVec128	= FMADD(_mm_mul_ps(c.m_contactNormal2.mVec128, body2.internalGetInvMass().mVec128), deltaImpulse, body2.internalGetDeltaLinearVelocity().mVec128);
+	body2.internalGetDeltaAngularVelocity().mVec128 = FMADD(c.m_angularComponentB.mVec128, deltaImpulse, body2.internalGetDeltaAngularVelocity().mVec128);
+	return deltaImpulse;
+}
+
+
+static btSimdScalar gResolveSingleConstraintRowLowerLimit_sse2(btSolverBody& body1, btSolverBody& body2, const btSolverConstraint& c)
+{
+	__m128 cpAppliedImp = _mm_set1_ps(c.m_appliedImpulse);
+	__m128	lowerLimit1 = _mm_set1_ps(c.m_lowerLimit);
+	__m128	upperLimit1 = _mm_set1_ps(c.m_upperLimit);
+	btSimdScalar deltaImpulse = _mm_sub_ps(_mm_set1_ps(c.m_rhs), _mm_mul_ps(_mm_set1_ps(c.m_appliedImpulse), _mm_set1_ps(c.m_cfm)));
+	__m128 deltaVel1Dotn = _mm_add_ps(btSimdDot3(c.m_contactNormal1.mVec128, body1.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos1CrossNormal.mVec128, body1.internalGetDeltaAngularVelocity().mVec128));
+	__m128 deltaVel2Dotn = _mm_add_ps(btSimdDot3(c.m_contactNormal2.mVec128, body2.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos2CrossNormal.mVec128, body2.internalGetDeltaAngularVelocity().mVec128));
+	deltaImpulse = _mm_sub_ps(deltaImpulse, _mm_mul_ps(deltaVel1Dotn, _mm_set1_ps(c.m_jacDiagABInv)));
+	deltaImpulse = _mm_sub_ps(deltaImpulse, _mm_mul_ps(deltaVel2Dotn, _mm_set1_ps(c.m_jacDiagABInv)));
+	btSimdScalar sum = _mm_add_ps(cpAppliedImp, deltaImpulse);
+	btSimdScalar resultLowerLess, resultUpperLess;
+	resultLowerLess = _mm_cmplt_ps(sum, lowerLimit1);
+	resultUpperLess = _mm_cmplt_ps(sum, upperLimit1);
+	__m128 lowMinApplied = _mm_sub_ps(lowerLimit1, cpAppliedImp);
+	deltaImpulse = _mm_or_ps(_mm_and_ps(resultLowerLess, lowMinApplied), _mm_andnot_ps(resultLowerLess, deltaImpulse));
+	c.m_appliedImpulse = _mm_or_ps(_mm_and_ps(resultLowerLess, lowerLimit1), _mm_andnot_ps(resultLowerLess, sum));
+	__m128	linearComponentA = _mm_mul_ps(c.m_contactNormal1.mVec128, body1.internalGetInvMass().mVec128);
+	__m128	linearComponentB = _mm_mul_ps(c.m_contactNormal2.mVec128, body2.internalGetInvMass().mVec128);
+	__m128 impulseMagnitude = deltaImpulse;
+	body1.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaLinearVelocity().mVec128, _mm_mul_ps(linearComponentA, impulseMagnitude));
+	body1.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaAngularVelocity().mVec128, _mm_mul_ps(c.m_angularComponentA.mVec128, impulseMagnitude));
+	body2.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaLinearVelocity().mVec128, _mm_mul_ps(linearComponentB, impulseMagnitude));
+	body2.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaAngularVelocity().mVec128, _mm_mul_ps(c.m_angularComponentB.mVec128, impulseMagnitude));
+	return deltaImpulse;
+}
+
+
+// Enhanced version of gResolveSingleConstraintRowGeneric_sse2 with SSE4.1 and FMA3
+static btSimdScalar gResolveSingleConstraintRowLowerLimit_sse4_1_fma3(btSolverBody& body1, btSolverBody& body2, const btSolverConstraint& c)
+{
+	__m128 tmp					= _mm_set_ps1(c.m_jacDiagABInv);
+	__m128 deltaImpulse			= _mm_set_ps1(c.m_rhs - btScalar(c.m_appliedImpulse)*c.m_cfm);
+	const __m128 lowerLimit		= _mm_set_ps1(c.m_lowerLimit);
+	const __m128 deltaVel1Dotn	= _mm_add_ps(DOT_PRODUCT(c.m_contactNormal1.mVec128, body1.internalGetDeltaLinearVelocity().mVec128), DOT_PRODUCT(c.m_relpos1CrossNormal.mVec128, body1.internalGetDeltaAngularVelocity().mVec128));
+	const __m128 deltaVel2Dotn	= _mm_add_ps(DOT_PRODUCT(c.m_contactNormal2.mVec128, body2.internalGetDeltaLinearVelocity().mVec128), DOT_PRODUCT(c.m_relpos2CrossNormal.mVec128, body2.internalGetDeltaAngularVelocity().mVec128));
+	deltaImpulse				= FMNADD(deltaVel1Dotn, tmp, deltaImpulse);
+	deltaImpulse				= FMNADD(deltaVel2Dotn, tmp, deltaImpulse);
+	tmp							= _mm_add_ps(c.m_appliedImpulse, deltaImpulse);
+	const __m128 mask			= _mm_cmpgt_ps(tmp, lowerLimit);
+	deltaImpulse				= _mm_blendv_ps(_mm_sub_ps(lowerLimit, c.m_appliedImpulse), deltaImpulse, mask);
+	c.m_appliedImpulse			= _mm_blendv_ps(lowerLimit, tmp, mask);
+	body1.internalGetDeltaLinearVelocity().mVec128	= FMADD(_mm_mul_ps(c.m_contactNormal1.mVec128, body1.internalGetInvMass().mVec128), deltaImpulse, body1.internalGetDeltaLinearVelocity().mVec128);
+	body1.internalGetDeltaAngularVelocity().mVec128 = FMADD(c.m_angularComponentA.mVec128, deltaImpulse, body1.internalGetDeltaAngularVelocity().mVec128);
+	body2.internalGetDeltaLinearVelocity().mVec128	= FMADD(_mm_mul_ps(c.m_contactNormal2.mVec128, body2.internalGetInvMass().mVec128), deltaImpulse, body2.internalGetDeltaLinearVelocity().mVec128);
+	body2.internalGetDeltaAngularVelocity().mVec128 = FMADD(c.m_angularComponentB.mVec128, deltaImpulse, body2.internalGetDeltaAngularVelocity().mVec128);
+	return deltaImpulse;
+}
+
+typedef btSimdScalar(*SingleConstraintSolver)(btSolverBody&, btSolverBody&, const btSolverConstraint&);
+static SingleConstraintSolver gResolveSingleConstraintRowGeneric;
+static SingleConstraintSolver gResolveSingleConstraintRowLowerLimit;
+
+class btCpuFeatureSelector
+{
+public:
+	enum btFeature
+	{
+		CPU_FEATURE_FMA3,
+		CPU_FEATURE_SSE4_1,
+	};
+
+	btCpuFeatureSelector() :
+		mExt(0)
+	{
+		memset(mCpuInfo, 0, sizeof(mCpuInfo));
+
+#if (_MSC_FULL_VER >= 160040219)
+		__cpuid(mCpuInfo, 1);
+		mExt = _xgetbv(0);
+#endif
+		if (IsSupported(CPU_FEATURE_FMA3) && IsSupported(CPU_FEATURE_SSE4_1))
+		{
+			gResolveSingleConstraintRowGeneric = gResolveSingleConstraintRowGeneric_sse4_1_fma3;
+			gResolveSingleConstraintRowLowerLimit = gResolveSingleConstraintRowLowerLimit_sse4_1_fma3;
+		}
+		else
+		{
+			gResolveSingleConstraintRowGeneric = gResolveSingleConstraintRowGeneric_sse2;
+			gResolveSingleConstraintRowLowerLimit = gResolveSingleConstraintRowLowerLimit_sse2;
+		}
+	}
+
+	bool IsSupported(btFeature inFeature)
+	{
+		switch (inFeature)
+		{
+		case btCpuFeatureSelector::CPU_FEATURE_FMA3:
+		{
+			const int OSXSAVEFlag = (1UL << 27);
+			const int AVXFlag = ((1UL << 28) | OSXSAVEFlag);
+			const int FMAFlag = ((1UL << 12) | AVXFlag | OSXSAVEFlag);
+			if ((mCpuInfo[2] & FMAFlag) == FMAFlag && (mExt & 6) == 6)
+				return true;
+			break;
+		}
+		case btCpuFeatureSelector::CPU_FEATURE_SSE4_1:
+		{
+			const int SSE41Flag = (1 << 19);
+			if (mCpuInfo[2] & SSE41Flag)
+				return true;
+			break;
+		}
+		default:
+			break;
+		}
+		return false;
+	}
+
+private:
+	int					mCpuInfo[4];
+	unsigned long long	mExt;
+} gCpuFeature;
+
+#endif //USE_SIMD
+
+
+btSimdScalar btSequentialImpulseConstraintSolver::resolveSingleConstraintRowGenericSIMD(btSolverBody& body1,btSolverBody& body2,const btSolverConstraint& c)
+{
+#ifdef USE_SIMD
+	return gResolveSingleConstraintRowGeneric(body1, body2, c);
 #else
 	return resolveSingleConstraintRowGeneric(body1,body2,c);
 #endif
@@ -129,29 +306,7 @@ btSimdScalar btSequentialImpulseConstraintSolver::resolveSingleConstraintRowGene
 btSimdScalar btSequentialImpulseConstraintSolver::resolveSingleConstraintRowLowerLimitSIMD(btSolverBody& body1,btSolverBody& body2,const btSolverConstraint& c)
 {
 #ifdef USE_SIMD
-	__m128 cpAppliedImp = _mm_set1_ps(c.m_appliedImpulse);
-	__m128	lowerLimit1 = _mm_set1_ps(c.m_lowerLimit);
-	__m128	upperLimit1 = _mm_set1_ps(c.m_upperLimit);
-	btSimdScalar deltaImpulse = _mm_sub_ps(_mm_set1_ps(c.m_rhs), _mm_mul_ps(_mm_set1_ps(c.m_appliedImpulse),_mm_set1_ps(c.m_cfm)));
-	__m128 deltaVel1Dotn	=	_mm_add_ps(btSimdDot3(c.m_contactNormal1.mVec128,body1.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos1CrossNormal.mVec128,body1.internalGetDeltaAngularVelocity().mVec128));
-	__m128 deltaVel2Dotn	=	_mm_add_ps(btSimdDot3(c.m_contactNormal2.mVec128,body2.internalGetDeltaLinearVelocity().mVec128), btSimdDot3(c.m_relpos2CrossNormal.mVec128,body2.internalGetDeltaAngularVelocity().mVec128));
-	deltaImpulse	=	_mm_sub_ps(deltaImpulse,_mm_mul_ps(deltaVel1Dotn,_mm_set1_ps(c.m_jacDiagABInv)));
-	deltaImpulse	=	_mm_sub_ps(deltaImpulse,_mm_mul_ps(deltaVel2Dotn,_mm_set1_ps(c.m_jacDiagABInv)));
-	btSimdScalar sum = _mm_add_ps(cpAppliedImp,deltaImpulse);
-	btSimdScalar resultLowerLess,resultUpperLess;
-	resultLowerLess = _mm_cmplt_ps(sum,lowerLimit1);
-	resultUpperLess = _mm_cmplt_ps(sum,upperLimit1);
-	__m128 lowMinApplied = _mm_sub_ps(lowerLimit1,cpAppliedImp);
-	deltaImpulse = _mm_or_ps( _mm_and_ps(resultLowerLess, lowMinApplied), _mm_andnot_ps(resultLowerLess, deltaImpulse) );
-	c.m_appliedImpulse = _mm_or_ps( _mm_and_ps(resultLowerLess, lowerLimit1), _mm_andnot_ps(resultLowerLess, sum) );
-	__m128	linearComponentA = _mm_mul_ps(c.m_contactNormal1.mVec128,body1.internalGetInvMass().mVec128);
-	__m128	linearComponentB = _mm_mul_ps(c.m_contactNormal2.mVec128,body2.internalGetInvMass().mVec128);
-	__m128 impulseMagnitude = deltaImpulse;
-	body1.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaLinearVelocity().mVec128,_mm_mul_ps(linearComponentA,impulseMagnitude));
-	body1.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body1.internalGetDeltaAngularVelocity().mVec128 ,_mm_mul_ps(c.m_angularComponentA.mVec128,impulseMagnitude));
-	body2.internalGetDeltaLinearVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaLinearVelocity().mVec128,_mm_mul_ps(linearComponentB,impulseMagnitude));
-	body2.internalGetDeltaAngularVelocity().mVec128 = _mm_add_ps(body2.internalGetDeltaAngularVelocity().mVec128 ,_mm_mul_ps(c.m_angularComponentB.mVec128,impulseMagnitude));
-	return deltaImpulse;
+	return gResolveSingleConstraintRowLowerLimit(body1, body2, c);
 #else
 	return resolveSingleConstraintRowLowerLimit(body1,body2,c);
 #endif
@@ -1741,5 +1896,3 @@ void	btSequentialImpulseConstraintSolver::reset()
 {
 	m_btSeed2 = 0;
 }
-
-
